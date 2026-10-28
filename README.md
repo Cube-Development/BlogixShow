@@ -127,6 +127,8 @@ The bot also lets users create projects from Telegram, receive and accept orders
 
 ### Runtime components
 
+> This section shows the core backend. For all services of the system (CRM, report service, scheduler, userbots, tax adapter, deployment) see **[docs/SYSTEM_OVERVIEW.md](docs/SYSTEM_OVERVIEW.md)**.
+
 ```
                     ┌───────────────────────────── backend ──────────────────────────────┐
  Web app ──────────►│                                                                     │
