@@ -205,7 +205,7 @@ Rules:
 | Storage | S3-compatible object storage |
 | Auth | JWT, Google OAuth2 |
 | Integrations | payment gateways, electronic documents, tax service, email, social network APIs, OpenAI |
-| Observability | structlog, Prometheus, Sentry |
+| Observability | structlog, Prometheus, Grafana, Alertmanager → Telegram, Sentry ([dashboards and alerts](docs/monitoring.md)) |
 | Delivery | Docker, GitHub Actions, Kubernetes |
 | Tests | pytest, pytest-asyncio, fakeredis |
 
