@@ -1,63 +1,224 @@
-# Album Collector
+# Advertiser ↔ Blogger Marketplace: Backend
 
-An [aiogram 3](https://docs.aiogram.dev/) middleware that turns a Telegram **media group** (an album of several photos / videos / documents) into **one** event, safely, across multiple bot workers.
+A backend for a marketplace where **advertisers** buy ad placements in **bloggers'** channels (mainly Telegram, with Instagram and YouTube support), and the platform handles everything in between: catalog, ordering, payments, publication control, documents and payouts.
 
-> Extracted from a production Telegram bot of an advertising marketplace and published for review only. See [LICENSE](LICENSE).
+> This repository is a **showcase**. The product is commercial and closed-source; only one self-contained module, the [Album Collector](#showcase-module-album-collector), is published here together with its tests. The sections below describe the whole system so the module can be seen in context. See [LICENSE](LICENSE).
 
 ---
 
 ## Table of contents
 
-- [Background](#background)
-- [The problem](#the-problem)
-- [How it works](#how-it-works)
-  - [Components](#components)
-  - [End-to-end flow](#end-to-end-flow)
-  - [Step by step](#step-by-step)
-  - [Redis data layout](#redis-data-layout)
-  - [Register results](#register-results)
-  - [Forwarded albums](#forwarded-albums)
-- [Guarantees](#guarantees)
-- [Edge cases](#edge-cases)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Testing](#testing)
-- [Project structure](#project-structure)
-- [Design decisions and trade-offs](#design-decisions-and-trade-offs)
+- [About the product](#about-the-product)
+  - [Roles](#roles)
+  - [Main flow](#main-flow)
+  - [Order lifecycle](#order-lifecycle)
+  - [Post verification in the Telegram bot](#post-verification-in-the-telegram-bot)
+  - [Money flow](#money-flow)
+  - [Other features](#other-features)
+- [Architecture](#architecture)
+  - [Runtime components](#runtime-components)
+  - [Layers](#layers)
+  - [Request flow](#request-flow)
+  - [Tech stack](#tech-stack)
+  - [Scale](#scale)
+- [Showcase module: Album Collector](#showcase-module-album-collector)
 
 ---
 
-## Background
+## About the product
 
-The module is part of the backend of an advertising marketplace, where advertisers buy ad placements in Telegram channels and channel owners fulfil orders.
+Buying ads from bloggers usually means manual work: finding channels, negotiating prices and dates in DMs, paying upfront with no guarantee, chasing the blogger to publish, and checking by hand that the post went out with the right text. The platform turns this into one managed process with escrow-style payments and automatic control of publication.
 
-The backend is a single Python service with several entry points:
+### Roles
+
+| Role | What they do |
+|------|--------------|
+| **Advertiser** | Searches the channel catalog, builds a campaign (project), pays, approves posts, receives reports. |
+| **Blogger** (channel owner) | Adds and verifies their channels, sets prices and available dates, accepts orders, publishes posts, gets paid. |
+| **Agency / manager** | Runs campaigns on behalf of clients: builds projects, coordinates bloggers, gets aggregated reports. |
+| **Moderator** | Approves channels and posts, handles complaints and disputes. |
+| **Superuser** | Platform administration, finance operations, reference data. |
+
+Users can act as a legal entity, an individual entrepreneur or an individual. Their legal data is validated against the national tax service.
+
+### Main flow
+
+```mermaid
+flowchart TD
+    subgraph Blogger
+        B1[Add channel] --> B2[Prove ownership<br/>verification code / bot admin]
+        B2 --> B3[Moderation of channel]
+        B3 --> B4[Set prices, formats,<br/>calendar of free dates]
+    end
+
+    subgraph Advertiser
+        A1[Search catalog<br/>filters, full-text search] --> A2[Add channels to cart]
+        A2 --> A3[Create project:<br/>brief, creatives, dates]
+        A3 --> A4[Pay from wallet<br/>or via payment gateway]
+    end
+
+    B4 -. channel appears in catalog .-> A1
+    A4 --> O1[Project launched:<br/>one order per channel]
+    O1 --> O2[Blogger gets order<br/>in web app + Telegram bot]
+    O2 -->|accepts| O3[Post agreed<br/>moderation / advertiser approval]
+    O2 -->|rejects| OX[Order cancelled,<br/>money returned to advertiser]
+    O3 --> O4[Blogger publishes post<br/>on the agreed date]
+    O4 --> O5[Bot verifies publication<br/>link / forward / album]
+    O5 --> O6[Screenshot + report<br/>for advertiser]
+    O6 --> O7[Order completed]
+    O7 --> M1[Blogger earnings released to wallet]
+    M1 --> M2[Withdrawal to card / bank,<br/>closing documents via e-docs]
+```
+
+### Order lifecycle
+
+A **project** is the advertiser's campaign. When it is launched, it is split into **orders**: one order per channel. Each order has its own status, date, post and chat, so one blogger's delay never blocks the others.
+
+The main path of an order, simplified:
 
 ```
-                    ┌──────────────────────────── backend ─────────────────────────────┐
- Web app / admin ──►│ FastAPI REST API  (auth, orders, channels, carts, wallet, ...)  │
-                    │                                                                   │
- Telegram ─webhook─►│ aiogram bot  ──► AlbumCollectorMiddleware ──► handlers           │
-                    │        │                                                          │
-                    │        └──────────► application layer (use cases, DTOs) ◄─────────┤
-                    │                         │                                         │
-                    │ FastStream worker (NATS) ┘  background jobs, events               │
-                    └───────────┬─────────────────────────────┬────────────────────────┘
-                                │                             │
-                          PostgreSQL                        Redis
-                     (SQLAlchemy, Alembic)       (FSM state, album buffers, locks)
+ wait ──► in_progress ──► post_review / moderation ──► advertiser_coordination ──► completed
+   │            │                    │                            │
+   └────────────┴──── rejected / canceled (money is returned) ────┘
+                         frozen (paused by the platform, can be resumed)
 ```
 
-- **FastAPI REST API** serves the web client and the admin panel.
-- **Telegram bot** (aiogram 3) runs in **webhook mode inside the same FastAPI app**, not as a separate polling process.
-- **Background worker** on FastStream + NATS handles asynchronous jobs and events.
-- The layers follow Clean Architecture: domain → application (use cases with input/output DTOs, read and write sides kept apart) → infrastructure → presentation. Dependencies are wired with **Dishka**, and the same use cases serve both the HTTP API and the bot.
+Every transition is a separate use case (`order_blogger_accept`, `order_blogger_reject`, `moderation_order_accept`, `advertiser_order_accept`, `publish_post`, ...). Each one changes the order, the paired project state and, where needed, the wallet in one place, so the state of money always follows the state of the order.
 
-One of the bot's jobs: after a channel owner publishes an ad post, they send it to the bot as proof (a link to the post, a forward of the post, or the post's media), and the backend verifies the submission.
+Reminders are sent to bloggers before the publication time, and late or missed publications are handled automatically.
 
-Many ad posts are **albums**, and forwarding an album is the most natural thing for a user to do. Because the bot lives inside a web service that runs as several workers/replicas, the updates of one album can be handled by different processes. This is why the collector keeps its state in Redis and not in process memory.
+### Post verification in the Telegram bot
 
-## The problem
+This is the part of the system the published module belongs to.
+
+1. After publishing, the blogger sends the post to the bot: a **link** (`t.me/channel/123`), a **forward** of the post, or the post as an **album**.
+2. The bot extracts the channel and the post from the message (forward metadata or the URL).
+3. The backend finds the blogger's orders for that channel for today.
+4. The text of the published post is compared with the brief (fuzzy matching, so small formatting differences do not fail the check).
+5. On a match, the publication is recorded, a screenshot is taken, and the advertiser sees the result in the report.
+
+Albums need special handling because Telegram delivers them as several separate updates. That is what the [Album Collector](#showcase-module-album-collector) solves.
+
+The bot also lets users create projects from Telegram, receive and accept orders, and get notifications.
+
+### Money flow
+
+- Every user has an internal **wallet**. Advertisers top it up through online payment gateways or by bank transfer with an invoice.
+- When a project is paid, the money is **held** on the platform, not sent to the blogger right away.
+- When an order is completed, the blogger's part is released to their wallet. When an order is cancelled or rejected, the advertiser gets the money back.
+- Bloggers withdraw earnings to a card or bank account; withdrawals go through approval.
+- Platform commission, VAT and promo code discounts are calculated in the domain layer and stored as separate lines, so every amount on an invoice can be traced.
+- Contracts, invoices and acts are signed through an **electronic document** service, with status updates coming back by webhook.
+
+### Other features
+
+- **Catalog and search**: full-text channel search with filters, categories and channel statistics collected from social networks.
+- **Channel calendar**: bloggers mark busy days and limits; the platform does not sell dates that are taken.
+- **Chats**: real-time chats per order and per project between the advertiser, the blogger and support.
+- **Notifications**: in-app (real-time), email and Telegram.
+- **Promo codes** for carts and projects.
+- **Reports**: PDF and Excel reports for advertisers and agencies, screenshots of published posts.
+- **AI helpers**: generating post text and images for a brief.
+- **Admin panel API**: moderation queues, order management, finance operations, bulk import of channels from spreadsheets.
+
+---
+
+## Architecture
+
+### Runtime components
+
+```
+                    ┌───────────────────────────── backend ──────────────────────────────┐
+ Web app ──────────►│                                                                     │
+ Admin panel ──────►│  FastAPI REST API  (/api/v1)                                        │
+                    │                                                                     │
+ Telegram ─webhook─►│  aiogram 3 bot  ──► AlbumCollectorMiddleware ──► handlers           │
+ Payment / e-docs ─►│  webhook endpoints                                                  │
+                    │            │                                                        │
+                    │            ▼                                                        │
+                    │  application layer: use cases with input / output DTOs             │
+                    │            ▲                                                        │
+                    │  FastStream worker (NATS): events, background jobs, reports        │
+                    └──┬──────────┬──────────┬───────────┬───────────┬───────────────────┘
+                       │          │          │           │           │
+                 PostgreSQL     Redis    Manticore   Centrifugo   S3 storage
+                 (write/read)  (cache,   (full-text  (real-time   (media, reports,
+                               bot state, search)    chats and    screenshots)
+                               locks)                notifications)
+```
+
+- **Web service.** FastAPI under gunicorn with several workers. The Telegram bot runs **in webhook mode inside the same app**, so bot updates are served by the same workers as HTTP requests.
+- **Worker.** A separate process on FastStream + NATS. Use cases publish events (order changed, channel added, report requested...), and consumers grouped by domain (order, project, channel, chat, notification, report, search) handle them asynchronously. A transactional outbox keeps events consistent with database writes.
+- **PostgreSQL** with separate write and read connections. Migrations with Alembic.
+- **Redis** for cache, bot FSM state, and short-lived coordination data such as album buffers and locks.
+- **Manticore Search** for catalog search, **Centrifugo** for real-time delivery, **S3** for files.
+
+### Layers
+
+The code follows **Clean Architecture** with a **CQRS-style split** of the application layer:
+
+```
+presentation   FastAPI routes, request/response models, bot handlers, middlewares
+     │
+application    use cases:  record/  (commands, change state)
+     │                     read/    (queries, return read models)
+     │                     events/  (event handlers)
+     │         each use case = dto.py + interface.py + use_case.py
+     │
+domain         entities, value objects, domain services (wallet, order, organization ...)
+     ▲
+infrastructure SQLAlchemy models and repositories, payment gateways, e-docs, search,
+               real-time, S3, email, social network clients, DI providers
+```
+
+Rules:
+- the domain has no dependencies on frameworks;
+- a use case depends only on interfaces (`Protocol`) that it declares itself, and returns DTOs, never ORM objects or domain entities;
+- infrastructure implements those interfaces;
+- everything is wired with **Dishka**, and the same use case is called from an HTTP route, a bot handler or a broker consumer.
+
+### Request flow
+
+1. A request reaches a FastAPI route (or a bot handler, or a broker consumer).
+2. The input is validated by a Pydantic model and converted into the use case input DTO.
+3. The use case is resolved from the DI container and called.
+4. The use case applies business rules through domain services and talks to the outside world only through its interfaces.
+5. Repositories run the SQL and return data.
+6. The use case returns an output DTO, and the route turns it into the HTTP response.
+
+### Tech stack
+
+| Area | Technology |
+|------|------------|
+| Language | Python 3.10, asyncio |
+| HTTP API | FastAPI, Pydantic, gunicorn / uvicorn |
+| Telegram | aiogram 3 (webhook) |
+| DI | Dishka |
+| Database | PostgreSQL, SQLAlchemy 2.0 async, asyncpg, Alembic |
+| Messaging | NATS, FastStream |
+| Cache / coordination | Redis |
+| Search | Manticore Search |
+| Real-time | Centrifugo |
+| Storage | S3-compatible object storage |
+| Auth | JWT, Google OAuth2 |
+| Integrations | payment gateways, electronic documents, tax service, email, social network APIs, OpenAI |
+| Observability | structlog, Prometheus, Sentry |
+| Delivery | Docker, GitHub Actions, Kubernetes |
+| Tests | pytest, pytest-asyncio, fakeredis |
+
+### Scale
+
+About **100,000 lines** of application code in ~1,800 files: several hundred use cases, ~50 database migrations, dozens of HTTP routers, and three deployable processes (web, worker, bot) built from one codebase.
+
+---
+
+## Showcase module: Album Collector
+
+An [aiogram 3](https://docs.aiogram.dev/) middleware that turns a Telegram **media group** (an album of several photos / videos / documents) into **one** event, safely, across multiple backend workers. It is used in the [post verification](#post-verification-in-the-telegram-bot) flow.
+
+Because the bot lives inside a web service that runs as several workers, the updates of one album can be handled by different processes. This is why the collector keeps its state in Redis and not in process memory.
+
+### The problem
 
 Telegram does not deliver an album as one message. It delivers **N separate updates** that share a `media_group_id`:
 
@@ -76,11 +237,11 @@ This causes four problems:
 
 There is also no "album finished" signal from Telegram. The only option is to wait for a quiet period.
 
-## How it works
+### How it works
 
 The idea: intercept album parts **before** any handler sees them, accumulate them in Redis, and when the album has stopped growing, hand the complete album to a single callback exactly once.
 
-### Components
+#### Components
 
 | Component | Responsibility |
 |-----------|----------------|
@@ -92,7 +253,7 @@ The idea: intercept album parts **before** any handler sees them, accumulate the
 | `forward_message` | Extracts forward source (channel id, username, message id, post URL) from a message or a stored part. |
 | `post_submission` | Builds the final `PostSubmissionInput` from an aggregated album. |
 
-### End-to-end flow
+#### End-to-end flow
 
 ```mermaid
 sequenceDiagram
@@ -132,7 +293,7 @@ sequenceDiagram
     C->>R: EVAL release_lock.lua (only if uuid matches)
 ```
 
-### Step by step
+#### Step by step
 
 **1. Middleware filter.**
 The middleware checks the incoming event. If it is not a `Message`, or `media_group_id` is `None`, it calls the next handler as usual. Single messages, commands and links are not affected at all.
@@ -171,7 +332,7 @@ The flush starts with `SET flush_lock <uuid> NX EX flush_lock_ttl_sec`.
 **8. Safe lock release.**
 In `finally`, the lock is released by a Lua script that deletes the key **only if it still holds our uuid**. If the lock had expired and another worker took it, we will not delete someone else's lock.
 
-### Redis data layout
+#### Redis data layout
 
 | Key | Value | TTL | Purpose |
 |-----|-------|-----|---------|
@@ -181,7 +342,7 @@ In `finally`, the lock is released by a Lua script that deletes the key **only i
 
 Every key has a TTL, so a crashed worker never leaves garbage in Redis forever.
 
-### Register results
+#### Register results
 
 `register_part` returns a `RegisterResult`, and the middleware acts on it:
 
@@ -192,7 +353,7 @@ Every key has a TTL, so a crashed worker never leaves garbage in Redis forever.
 | `DUPLICATE` | same `message_id` already in the buffer | stop, no handler |
 | `IGNORED` | already processed / no media / no sender | log a warning, stop |
 
-### Forwarded albums
+#### Forwarded albums
 
 When a user forwards an album from a channel, each part has its own forward metadata. `AlbumPart` stores it explicitly (`forward_chat_id`, `forward_chat_username`, `forward_message_id`, `forward_date`), so it survives the round trip through Redis.
 
@@ -210,7 +371,7 @@ When building the result, `AggregatedAlbum` gives deterministic answers regardle
 
 Both the legacy `forward_from_chat` fields and the newer `forward_origin` API are supported.
 
-## Guarantees
+### Guarantees
 
 | Property | How |
 |----------|-----|
@@ -222,7 +383,7 @@ Both the legacy `forward_from_chat` fields and the newer `forward_origin` API ar
 | Bounded memory | TTL on every key; timers and `last_message` are removed on flush |
 | Order independence | results are derived from parts sorted by `message_id` |
 
-## Edge cases
+### Edge cases
 
 | Situation | Behaviour |
 |-----------|-----------|
@@ -235,7 +396,7 @@ Both the legacy `forward_from_chat` fields and the newer `forward_origin` API ar
 | Buffer expired before flush | logged, nothing is called |
 | Text-only message or command | not touched by the middleware |
 
-## Configuration
+### Configuration
 
 ```python
 @define
@@ -253,7 +414,7 @@ How to choose the values:
 - `buffer_ttl_sec` must be noticeably larger than `debounce_ms`.
 - `flush_lock_ttl_sec` must cover the worst-case duration of `on_flush`.
 
-## Usage
+### Usage
 
 ```python
 from aiogram import Bot, Dispatcher
@@ -286,7 +447,7 @@ dp.message.outer_middleware(AlbumCollectorMiddleware(collector))
 
 Return `False` from the callback (or raise) when the album could not be handled. It will not be marked as processed.
 
-## Testing
+### Testing
 
 ```bash
 pip install -r requirements-dev.txt
@@ -309,7 +470,7 @@ What is covered (18 tests):
 - forward metadata survives a Redis round trip;
 - caption / link / forward parsing into `PostSubmissionInput`.
 
-## Project structure
+### Project structure
 
 ```
 album_collector/
@@ -327,7 +488,7 @@ tests/
 └── test_redis_store.py
 ```
 
-## Design decisions and trade-offs
+### Design decisions and trade-offs
 
 - **Middleware, not a handler.** Album parts are stopped before routing, so no existing handler has to know about albums. Business logic receives an already complete album.
 - **Storage behind a protocol.** The collector depends on `AlbumBufferStore`, not on Redis. Tests use the in-memory store, production uses Redis, and the collector code is the same.
