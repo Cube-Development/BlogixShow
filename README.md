@@ -2,7 +2,7 @@
 
 A backend for a marketplace where **advertisers** buy ad placements in **bloggers'** channels (mainly Telegram, with Instagram and YouTube support), and the platform handles everything in between: catalog, ordering, payments, publication control, documents and payouts.
 
-> This repository is a **showcase**. The product is commercial and closed-source; only one self-contained module, the [Album Collector](#showcase-module-album-collector), is published here together with its tests. The sections below describe the whole system so the module can be seen in context. See [LICENSE](LICENSE).
+> This repository is a **showcase**. The product is commercial and closed-source. Published here: the [Telegram bot source code](#telegram-bot-source-code) and the [Album Collector](#showcase-module-album-collector) module, which is extracted so it can run and be tested on its own. The sections below describe the whole system so the code can be seen in context. See [LICENSE](LICENSE).
 
 ---
 
@@ -21,6 +21,7 @@ A backend for a marketplace where **advertisers** buy ad placements in **blogger
   - [Request flow](#request-flow)
   - [Tech stack](#tech-stack)
   - [Scale](#scale)
+- [Telegram bot source code](#telegram-bot-source-code)
 - [Showcase module: Album Collector](#showcase-module-album-collector)
 
 ---
@@ -211,6 +212,38 @@ Rules:
 ### Scale
 
 About **100,000 lines** of application code in ~1,800 files: several hundred use cases, ~50 database migrations, dozens of HTTP routers, and three deployable processes (web, worker, bot) built from one codebase.
+
+---
+
+## Telegram bot source code
+
+The Telegram bot of the platform, as it is in the main repository: about 16,000 lines of code and 7,000 lines of tests. The paths are kept the same as in the project, so the layers are visible.
+
+```
+bot.py                                       # local polling entry point (production runs via webhook in the API)
+advertiser_blogger/
+├── presentation/bot/                        # aiogram layer
+│   ├── handlers/                            # user, channel, group and agency handlers
+│   ├── filters/  keyboards/  states/        # routing filters, inline keyboards, FSM states
+│   ├── album/                               # Album Collector (media group buffering)
+│   ├── message_batch/                       # batching of several messages into one submission
+│   └── common/                              # parsing of forwards, links and post submissions, texts
+├── application/interactors_bot/             # bot use cases
+│   ├── verify_and_publish_post/             # check a published post against the brief
+│   ├── verify_submission_processor/         # one entry point for link / forward / album submissions
+│   ├── run_post_checking/                   # batch check of published posts for selected projects
+│   ├── match_and_attach_post/               # find the order a post belongs to by text similarity
+│   ├── project_create/                      # creating an ad project from Telegram
+│   ├── publish_post_broadcast/              # record the publication, events and notifications
+│   └── ...
+└── infrastructure/bot/                      # bot instance, deep links, HTML → Telegram formatting, templates
+tests/unit/presentation/bot/                 # handler, parser and collector tests
+tests/unit/application/interactors_bot/     # use case tests
+```
+
+Handlers contain no business logic: they parse the update, build an input DTO and call a use case resolved from the Dishka container. The same use cases and domain services are used by the HTTP API.
+
+> This code imports the domain, the main application layer and the DI setup of the closed-source project, so it is published **for reading** and does not run on its own. The runnable and tested part is the Album Collector below.
 
 ---
 
