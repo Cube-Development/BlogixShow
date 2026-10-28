@@ -29,9 +29,33 @@ An [aiogram 3](https://docs.aiogram.dev/) middleware that turns a Telegram **med
 
 ## Background
 
-The bot belongs to a marketplace where advertisers buy ad placements in Telegram channels. After a channel owner publishes an ad post, they send it to the bot as proof: a link to the post, a forward of the post, or the post's media. The bot then verifies the submission.
+The module is part of the backend of an advertising marketplace, where advertisers buy ad placements in Telegram channels and channel owners fulfil orders.
 
-Many ad posts are **albums**. Forwarding an album to the bot is the most natural thing for a user to do, and this is where things break without special handling.
+The backend is a single Python service with several entry points:
+
+```
+                    ┌──────────────────────────── backend ─────────────────────────────┐
+ Web app / admin ──►│ FastAPI REST API  (auth, orders, channels, carts, wallet, ...)  │
+                    │                                                                   │
+ Telegram ─webhook─►│ aiogram bot  ──► AlbumCollectorMiddleware ──► handlers           │
+                    │        │                                                          │
+                    │        └──────────► application layer (use cases, DTOs) ◄─────────┤
+                    │                         │                                         │
+                    │ FastStream worker (NATS) ┘  background jobs, events               │
+                    └───────────┬─────────────────────────────┬────────────────────────┘
+                                │                             │
+                          PostgreSQL                        Redis
+                     (SQLAlchemy, Alembic)       (FSM state, album buffers, locks)
+```
+
+- **FastAPI REST API** serves the web client and the admin panel.
+- **Telegram bot** (aiogram 3) runs in **webhook mode inside the same FastAPI app**, not as a separate polling process.
+- **Background worker** on FastStream + NATS handles asynchronous jobs and events.
+- The layers follow Clean Architecture: domain → application (use cases with input/output DTOs, read and write sides kept apart) → infrastructure → presentation. Dependencies are wired with **Dishka**, and the same use cases serve both the HTTP API and the bot.
+
+One of the bot's jobs: after a channel owner publishes an ad post, they send it to the bot as proof (a link to the post, a forward of the post, or the post's media), and the backend verifies the submission.
+
+Many ad posts are **albums**, and forwarding an album is the most natural thing for a user to do. Because the bot lives inside a web service that runs as several workers/replicas, the updates of one album can be handled by different processes. This is why the collector keeps its state in Redis and not in process memory.
 
 ## The problem
 
@@ -48,7 +72,7 @@ This causes four problems:
 1. **Duplicate processing.** A regular handler fires once per part, so verification (and every side effect behind it) runs N times.
 2. **The caption is on one part only**, and it is not always the first part to arrive. Updates can come out of order.
 3. **Forward metadata is per part.** Each forwarded part carries its own `forward_origin`. You cannot just take "the last message" and trust it as the album source.
-4. **Horizontal scaling.** With several bot workers behind a webhook, the parts of one album can land on different processes. An in-memory buffer cannot see the whole album.
+4. **Horizontal scaling.** The webhook is served by several backend workers, so the parts of one album can land on different processes. An in-memory buffer cannot see the whole album.
 
 There is also no "album finished" signal from Telegram. The only option is to wait for a quiet period.
 
@@ -308,5 +332,5 @@ tests/
 - **Middleware, not a handler.** Album parts are stopped before routing, so no existing handler has to know about albums. Business logic receives an already complete album.
 - **Storage behind a protocol.** The collector depends on `AlbumBufferStore`, not on Redis. Tests use the in-memory store, production uses Redis, and the collector code is the same.
 - **Lua instead of `WATCH`/`MULTI`.** One round trip, no retry loops, and the dedup check is atomic with the write.
-- **Callback decides success.** The collector does not know what "processed" means. The callback returns a boolean, and that keeps the module reusable.
+- **Callback decides success.** The collector does not know what "processed" means. The callback returns a boolean, and that keeps the module reusable. In the backend, the callback resolves the verification use case from the Dishka container, so the album path and the single-message path go through the same application logic.
 - **Debounce timers are per process.** The timer lives in the worker that received the part. With several workers, each one may try to flush. The Redis lock and the `processed` marker make sure only one flush wins, and later attempts see the buffer gone. The cost is that a worker may fire its flush slightly before parts that went to another worker have arrived. In practice the debounce window covers this, and the shared Redis buffer means the winner still sees every part appended so far.
