@@ -1,0 +1,4 @@
+aiogram==3.28.2
+attrs==23.2.0
+redis==5.1.1
+structlog
