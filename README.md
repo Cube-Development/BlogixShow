@@ -1,4 +1,5 @@
 # Advertiser ↔ Blogger Marketplace: Backend
+site: https://blogix.uz
 
 A backend for a marketplace where **advertisers** buy ad placements in **bloggers'** channels (mainly Telegram, with Instagram and YouTube support), and the platform handles everything in between: catalog, ordering, payments, publication control, documents and payouts.
 
